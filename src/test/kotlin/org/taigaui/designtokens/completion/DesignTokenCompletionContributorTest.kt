@@ -1,8 +1,11 @@
 package org.taigaui.designtokens.completion
 
+import com.intellij.codeInsight.lookup.LookupManager
+import com.intellij.openapi.components.service
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.intellij.testFramework.runInEdtAndGet
 import org.taigaui.designtokens.project.DesignTokenIndexService
 import java.nio.file.Files
 import java.nio.file.Path
@@ -91,6 +94,26 @@ class DesignTokenCompletionContributorTest : BasePlatformTestCase() {
         val suggestions = complete("--tui-ra")
 
         assertFalse(suggestions.contains("--tui-radius.%"))
+    }
+
+    fun testCompletionPreviewControllerBuildsPreviewForActiveLookup() {
+        val sourcePath = configureCompletion("--tui-")
+
+        indexService.completionTokenNames(sourcePath)
+        val variants = requireNotNull(myFixture.completeBasic())
+
+        assertTrue(variants.size > 1)
+
+        val controller = project.service<DesignTokenCompletionPreviewController>()
+        val lookup =
+            requireNotNull(
+                runInEdtAndGet { LookupManager.getActiveLookup(myFixture.editor) },
+            )
+
+        invokePrivate(controller, "requestPreview", lookup)
+
+        assertNotNull(waitForPrivateField(controller, "previewKey"))
+        assertNotNull(waitForPrivateField(controller, "previewPanel"))
     }
 
     fun testCompletesSingleInstalledTokenMatch() {
@@ -351,6 +374,43 @@ class DesignTokenCompletionContributorTest : BasePlatformTestCase() {
         myFixture.editor.caretModel.moveToOffset(caretOffset)
 
         return sourcePath
+    }
+
+    private fun invokePrivate(
+        target: Any,
+        methodName: String,
+        argument: Any,
+    ) {
+        val method =
+            target.javaClass.declaredMethods
+                .single { candidate ->
+                    candidate.name == methodName &&
+                        candidate.parameterCount == 1
+                }.apply { isAccessible = true }
+
+        runInEdtAndGet { method.invoke(target, argument) }
+    }
+
+    private fun waitForPrivateField(
+        target: Any,
+        fieldName: String,
+    ): Any? {
+        val field =
+            target.javaClass
+                .getDeclaredField(fieldName)
+                .apply { isAccessible = true }
+
+        repeat(200) {
+            val value = runInEdtAndGet { field.get(target) }
+
+            if (value != null) {
+                return value
+            }
+
+            Thread.sleep(10)
+        }
+
+        return runInEdtAndGet { field.get(target) }
     }
 
     private fun createFile(

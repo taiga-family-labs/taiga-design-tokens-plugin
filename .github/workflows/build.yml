@@ -9,6 +9,7 @@ on:
 permissions:
     contents: read
     id-token: write
+    pull-requests: write
 
 concurrency:
     group: build-${{ github.workflow }}-${{ github.ref }}
@@ -66,6 +67,142 @@ jobs:
                   verifyPluginProjectConfiguration
                   -Djava.net.useSystemProxies=false
                   --stacktrace
+
+            - name: Collect JaCoCo coverage metrics
+              id: jacoco
+              run: |
+                  python - <<'PY'
+                  import os
+                  import xml.etree.ElementTree as ET
+                  from pathlib import Path
+
+                  report = Path("build/reports/jacoco/test/jacocoTestReport.xml")
+                  root = ET.parse(report).getroot()
+
+                  def counter(kind):
+                      item = next(
+                          (c for c in root.findall("counter") if c.attrib["type"] == kind),
+                          None,
+                      )
+                      if item is None:
+                          return 0, 0, 0, 100.0
+
+                      missed = int(item.attrib["missed"])
+                      covered = int(item.attrib["covered"])
+                      total = missed + covered
+                      percent = 100.0 if total == 0 else covered * 100.0 / total
+
+                      return covered, missed, total, percent
+
+                  output = Path(os.environ["GITHUB_OUTPUT"])
+
+                  with output.open("a") as github_output:
+                      for kind in ("LINE", "BRANCH", "METHOD", "CLASS"):
+                          covered, missed, total, percent = counter(kind)
+                          key = kind.lower()
+
+                          print(
+                              f"COVERAGE {kind}: {percent:.2f}% "
+                              f"(covered={covered}, missed={missed}, total={total})"
+                          )
+
+                          github_output.write(f"{key}_percent={percent:.2f}%\n")
+                          github_output.write(f"{key}_covered={covered}\n")
+                          github_output.write(f"{key}_missed={missed}\n")
+                          github_output.write(f"{key}_total={total}\n")
+
+                  missed_files = []
+                  for package in root.findall("package"):
+                      package_name = package.attrib["name"]
+
+                      for source in package.findall("sourcefile"):
+                          lines = [
+                              line.attrib["nr"]
+                              for line in source.findall("line")
+                              if int(line.attrib.get("mi", "0")) > 0
+                          ]
+
+                          if lines:
+                              missed_files.append(
+                                  (
+                                      len(lines),
+                                      f"{package_name}/{source.attrib['name']}",
+                                      lines,
+                                  ),
+                              )
+
+                  print("TOP MISSED SOURCE FILES:")
+                  for missed, path, lines in sorted(missed_files, reverse=True)[:40]:
+                      print(f"MISSED {missed:4d} {path}: {','.join(lines)}")
+
+                  print(f"MISSED SOURCE FILES: {len(missed_files)}")
+                  PY
+
+            - name: Publish JaCoCo coverage to pull request
+              if: github.event_name == 'pull_request'
+              uses: actions/github-script@v8
+              env:
+                  LINE_PERCENT: ${{ steps.jacoco.outputs.line_percent }}
+                  LINE_COVERED: ${{ steps.jacoco.outputs.line_covered }}
+                  LINE_MISSED: ${{ steps.jacoco.outputs.line_missed }}
+                  LINE_TOTAL: ${{ steps.jacoco.outputs.line_total }}
+                  BRANCH_PERCENT: ${{ steps.jacoco.outputs.branch_percent }}
+                  BRANCH_COVERED: ${{ steps.jacoco.outputs.branch_covered }}
+                  BRANCH_MISSED: ${{ steps.jacoco.outputs.branch_missed }}
+                  BRANCH_TOTAL: ${{ steps.jacoco.outputs.branch_total }}
+                  METHOD_PERCENT: ${{ steps.jacoco.outputs.method_percent }}
+                  METHOD_COVERED: ${{ steps.jacoco.outputs.method_covered }}
+                  METHOD_MISSED: ${{ steps.jacoco.outputs.method_missed }}
+                  METHOD_TOTAL: ${{ steps.jacoco.outputs.method_total }}
+                  CLASS_PERCENT: ${{ steps.jacoco.outputs.class_percent }}
+                  CLASS_COVERED: ${{ steps.jacoco.outputs.class_covered }}
+                  CLASS_MISSED: ${{ steps.jacoco.outputs.class_missed }}
+                  CLASS_TOTAL: ${{ steps.jacoco.outputs.class_total }}
+              with:
+                  script: |
+                      const marker = '<!-- jacoco-coverage-report -->';
+                      const body = [
+                          marker,
+                          '## JaCoCo Coverage',
+                          '',
+                          '| Metric | Coverage | Covered | Missed | Total |',
+                          '| --- | ---: | ---: | ---: | ---: |',
+                          `| Lines | **${process.env.LINE_PERCENT}** | ${process.env.LINE_COVERED} | ${process.env.LINE_MISSED} | ${process.env.LINE_TOTAL} |`,
+                          `| Branches | **${process.env.BRANCH_PERCENT}** | ${process.env.BRANCH_COVERED} | ${process.env.BRANCH_MISSED} | ${process.env.BRANCH_TOTAL} |`,
+                          `| Methods | **${process.env.METHOD_PERCENT}** | ${process.env.METHOD_COVERED} | ${process.env.METHOD_MISSED} | ${process.env.METHOD_TOTAL} |`,
+                          `| Classes | **${process.env.CLASS_PERCENT}** | ${process.env.CLASS_COVERED} | ${process.env.CLASS_MISSED} | ${process.env.CLASS_TOTAL} |`,
+                          '',
+                          `Updated for commit \`${context.sha.slice(0, 7)}\`.`,
+                      ].join('\n');
+
+                      const comments = await github.paginate(github.rest.issues.listComments, {
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: context.issue.number,
+                          per_page: 100,
+                      });
+
+                      const existing = comments.find(
+                          (comment) =>
+                              comment.user?.type === 'Bot' &&
+                              comment.body?.includes(marker),
+                      );
+
+                      if (existing) {
+                          await github.rest.issues.updateComment({
+                              owner: context.repo.owner,
+                              repo: context.repo.repo,
+                              comment_id: existing.id,
+                              body,
+                          });
+                      } else {
+                          await github.rest.issues.createComment({
+                              owner: context.repo.owner,
+                              repo: context.repo.repo,
+                              issue_number: context.issue.number,
+                              body,
+                          });
+                      }
 
             - name: Upload coverage to Codecov
               uses: codecov/codecov-action@v5
